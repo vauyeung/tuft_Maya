@@ -1,0 +1,240 @@
+---
+title: "Read In Velocyto and 10x objects for Maya"
+output: 
+  github_document:
+    toc: true
+  html_notebook:
+    toc: true
+---
+
+# Environment
+
+```{r}
+library(tidyverse)
+library(Seurat)
+library(SeuratWrappers)
+library(SeuratDisk)
+library(velocyto.R)
+```
+Names of Maya's samples
+```{r}
+names <- c('OE_control','OE_IL13','OE_M2','OE_M2_IL13','OE_M4')
+```
+# Read in Velocyto loom files
+Read in all objects as Velocity, convert to seurat, return list of objects.
+There is some kind of bug in ReadVelocity where it is pulling gene symbols, which are not guaranteed unique. see issue #78. Will overwrite read.loom.matrices with a function that appends accession numbers to gene symbols to ensure uniqueness.
+```{r}
+read.loom.matrices <- function(file) {
+  # modified from velocytoR source code to account for non-uniqueness.
+  cat('reading loom file via hdf5r...\n')
+    f <- hdf5r::H5File$new(file, mode='r')
+    cells <- f[["col_attrs/CellID"]][]
+    genes <- paste0(f[["row_attrs/Gene"]][],'.',f[["row_attrs/Accession"]][]) # changed to gene.accession
+    dl <- c(spliced="layers/spliced",
+            unspliced="layers/unspliced",
+            ambiguous="layers/ambiguous")
+    if("layers/spanning" %in% hdf5r::list.datasets(f)) {
+      dl <- c(dl, c(spanning="layers/spanning"))
+    }
+    dlist <- lapply(dl, function(path) {
+      m <- as(t(f[[path]][,]),'dgCMatrix')
+      rownames(m) <- genes; colnames(m) <- cells;
+      return(m)
+    })
+    f$close_all()
+    return(dlist)
+}
+```
+
+Actually read in the looms and convert to list of seurat objects. Also add some basic group metadata
+```{r}
+seu.velocity.list <- lapply(names, function(name){
+  dir <- paste0('./count/',name,'/velocyto/')
+  # Assumes a single loom file per library
+  loom.filename <- list.files(dir, pattern='*.loom')
+  vel.object <- read.loom.matrices(file=paste0(dir,loom.filename))
+  seu.object <- as.Seurat(x=vel.object)
+  # Add metadata
+  seu.object$group <- name
+  return(seu.object)
+})
+```
+
+# Read in 10X data
+```{r}
+seu.10x.list <- lapply(names, function(name){
+  dir <- paste0('./count/',name,'/outs/')
+  raw.matrix <- Read10X(dir)
+  seu.object <- CreateSeuratObject(counts=raw.matrix)
+  # add metadata
+  seu.object$group <- name
+  return(seu.object)
+})
+```
+
+# Merge velocity data with corresponding 10x data
+
+## helper functions
+
+### Function to rename velocity/loom cells
+Velocity/Loom seems to have named cells in the form library:Barcodex, e.g., KO:AAACCCATCCCTCTCCx. Seurat appends a dash for whatever reason i suppose in case of nonuniqueness which is actually relatively improbable.
+```{r}
+ConvertVelocityCellToSeuratCell <- function(vector) {
+  list <- lapply(vector, function(name) {
+    name <- strsplit(name, ':')[[1]][2]
+    name <- substr(name,1,nchar(name)-1)
+    name <- paste0(name,'-1')
+    return(name)
+  })
+  return(unlist(list))
+}
+```
+
+### Helper function to transfer assays
+Three assays come in the loom file: spliced, unspliced, and ambiguous. 
+```{r}
+ImportVelocityAssays <- function(Seurat10xObj, SeuratVelocityObj) {
+  # Requires that the cell names have been matched already
+  # Returns an object with all the data from both
+  Seurat10xObj[['spliced']] <- SeuratVelocityObj[['spliced']]
+  Seurat10xObj[['unspliced']] <- SeuratVelocityObj[['unspliced']]
+  Seurat10xObj[['ambiguous']] <- SeuratVelocityObj[['ambiguous']]
+  return(Seurat10xObj)
+}
+```
+
+## Validate barcode match
+One predicts that the converted names for the loom-Seurat objects will be identical to names in the Seurat10x objects. If this is not the case there is a problem.
+```{r}
+for(i in 1:length(names)){
+  seu.10x.obj <- seu.10x.list[[i]]
+  seu.vel.obj <- seu.velocity.list[[i]]
+  print(names[i])
+  print(setequal(ConvertVelocityCellToSeuratCell(Cells(seu.vel.obj)), Cells(seu.10x.obj)))
+  rm(seu.vel.obj)
+  rm(seu.10x.obj)
+}
+```
+
+## Rename velocity cells
+
+```{r}
+seu.vel.renamed.list <- lapply(seu.velocity.list, function(seu.vel.obj){
+  seu.vel.renamed.obj <- RenameCells(seu.vel.obj,
+                                     new.names=ConvertVelocityCellToSeuratCell(Cells(seu.vel.obj)))
+})
+```
+
+## Transfer assays to 10x objects
+```{r}
+seu.10x.vel.list <- lapply(1:length(names), function(i){
+  seu.10x.obj <- seu.10x.list[[i]]
+  seu.vel.renamed.obj <- seu.vel.renamed.list[[i]]
+  seu.10x.vel.obj <- ImportVelocityAssays(seu.10x.obj, seu.vel.renamed.obj)
+  # Set default assay in case it's ambiguous
+  DefaultAssay(seu.10x.vel.obj) <- 'RNA'
+  return(seu.10x.vel.obj)
+})
+```
+
+## cleanup cleanup
+```{r}
+rm(seu.10x.list, seu.vel.renamed.list, seu.velocity.list)
+gc()
+```
+
+# Merge and Integrate
+Using the newer Seurat5 workflow which differs from previous analysis. 
+## Merge
+```{r}
+# Seurat merge expects 1 object and a list of remainder.
+tuft.vel.cells <- merge(seu.10x.vel.list[[1]], seu.10x.vel.list[-1])
+```
+
+## preprocessing
+```{r}
+tuft.vel.cells[['percent.mt']] <-  PercentageFeatureSet(tuft.vel.cells, pattern = "^mt-")
+```
+```{r}
+VlnPlot(tuft.vel.cells, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3, pt.size = 0)
+```
+```{r}
+tuft.vel.cells <- subset(tuft.vel.cells, subset = nFeature_RNA > 1000 & nFeature_RNA < 7500 & percent.mt < 7.5)
+VlnPlot(tuft.vel.cells, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3, pt.size = 0)
+```
+## processing
+```{r}
+# general processing
+tuft.vel.cells <- NormalizeData(tuft.vel.cells, verbose=F)
+tuft.vel.cells <- FindVariableFeatures(tuft.vel.cells, verbose=F)
+tuft.vel.cells <- ScaleData(tuft.vel.cells, features=rownames(tuft.vel.cells), verbose=F)
+tuft.vel.cells <- RunPCA(tuft.vel.cells, verbose=F)
+```
+
+## integration
+This is a new workflow for me.
+```{r}
+tuft.vel.cells <- IntegrateLayers(object=tuft.vel.cells, method=FastMNNIntegration,
+                                  orig.reduction = "pca", new.reduction = "integrated.mnn",
+                                  verbose = FALSE)
+# "rejoin layers" says Seurat
+tuft.vel.cells[["RNA"]] <- JoinLayers(tuft.vel.cells[["RNA"]])
+```
+
+## Clustering and UMAP embedding on integrated data
+```{r}
+tuft.vel.cells <- FindNeighbors(tuft.vel.cells, reduction='integrated.mnn', dims=1:30, verbose=F)
+tuft.vel.cells <- FindClusters(tuft.vel.cells, resolution=0.5, verbose=F)
+tuft.vel.cells <- RunUMAP(tuft.vel.cells, reduction='integrated.mnn', dims=1:30, verbose=F)
+```
+```{r}
+DimPlot(tuft.vel.cells)
+DimPlot(tuft.vel.cells, group.by = 'group')
+DimPlot(tuft.vel.cells, split.by = 'group')
+```
+
+# Quick look
+
+## Cell cycle
+Did not scale data / adjust for cell cycle during pre-processing, add those scores here anyway.
+```{r}
+s.genes <- str_to_title(cc.genes$s.genes)
+g2m.genes <- str_to_title(cc.genes$g2m.genes)
+tuft.vel.cells <- CellCycleScoring(tuft.vel.cells, s.features = s.genes, g2m.features = g2m.genes, set.ident = F)
+```
+```{r}
+FeaturePlot(tuft.vel.cells, features=c('S.Score','G2M.Score','nFeature_RNA','percent.mt'))
+```
+
+
+## Cluster exploration
+```{r}
+FeaturePlot(tuft.vel.cells, features=c('Pou2f3','Trpm5','Krt5','Krt8'))
+FeaturePlot(tuft.vel.cells, features=c('Ptprc','Ccr2','Omp','Pdgfra'))
+```
+
+## Save object
+```{r, eval=F}
+save(tuft.vel.cells, file='tuft.vel.cells.Robj')
+```
+
+
+# VelocytoR
+see if this makes any sense at all
+
+## Velocity on OE_M2
+When some of the action might actually be happening?
+```{r}
+bm <- RunVelocity(object = subset(tuft.vel.cells, subset=group=='OE_M2'), deltaT = 1, kCells = 25, fit.quantile = 0.02)
+ident.colors <- (scales::hue_pal())(n = length(x = levels(x = bm)))
+names(x = ident.colors) <- levels(x = bm)
+cell.colors <- ident.colors[Idents(object = bm)]
+names(x = cell.colors) <- colnames(x = bm)
+```
+```{r, fig.height=8, fig.width=10}
+show.velocity.on.embedding.cor(emb = Embeddings(object = bm, reduction = "umap"), vel = Tool(object = bm, 
+    slot = "RunVelocity"), n = 200, scale = "sqrt", cell.colors = ac(x = cell.colors, alpha = 0.5), 
+    cex = 0.8, arrow.scale = 3, show.grid.flow = TRUE, min.grid.cell.mass = 0.5, grid.n = 40, arrow.lwd = 1, 
+    do.par = FALSE, cell.border.alpha = 0.1)
+```
+
